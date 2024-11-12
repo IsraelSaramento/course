@@ -1,0 +1,621 @@
+<?php
+
+/**
+ * @file
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\media\Entity\Media;
+use Drupal\node\Entity\NodeType;
+use Drupal\node\NodeInterface;
+use Drupal\views\ViewExecutable;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+
+const MEDIA_IMAGE_PLACEHOLDER = 5254;
+
+/**
+ * Implements hook_theme().
+ */
+function pll_course_theme($existing, $type, $theme, $path) {
+  return [
+    'extra_field_template' => [
+      'variables' => [
+        'attributes' => new Attribute(
+          ['class' => ['inline-display']]
+        ),
+        'field_name' => NULL,
+        'label' => NULL,
+        'label_display' => 'inline',
+        'label_tag' => NULL,
+        'title_attributes' => new Attribute(['class' => ['field__label']]),
+        'item_attributes' => new Attribute(['class' => ['field__item']]),
+        'item_content' => NULL,
+      ],
+      'template' => 'extra_field_template',
+    ],
+    'custom_link_formatter' => [
+      'variables' => [
+        'value' => NULL,
+        'label' => NULL,
+      ],
+      'template' => 'custom-link-formatter',
+    ],
+
+  ];
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function pll_course_entity_extra_field_info() {
+  $extra = [];
+
+  // Create pseudo fields.
+  foreach (NodeType::loadMultiple() as $bundle) {
+    // Course pseudo fields.
+    if ($bundle->get('type') === 'course') {
+      $extra['node'][$bundle->Id()]['display']['course_pseudo_field_date'] = [
+        'label' => t('Course pseudo field - date'),
+        'description' => t('This is a Course pseudo field'),
+        'weight' => 100,
+        'visible' => TRUE,
+      ];
+      $extra['node'][$bundle->Id()]['display']['course_pseudo_field_modality'] = [
+        'label' => t('Course pseudo field - modality'),
+        'description' => t('This is a Course pseudo field'),
+        'weight' => 100,
+        'visible' => TRUE,
+      ];
+      $extra['node'][$bundle->Id()]['display']['course_pseudo_field_platform'] = [
+        'label' => t('Course pseudo field - platform'),
+        'description' => t('This is a Course pseudo field'),
+        'weight' => 100,
+        'visible' => TRUE,
+      ];
+      $extra['node'][$bundle->Id()]['display']['course_pseudo_field_registration_deadline'] = [
+        'label' => t('Course pseudo field - registration deadline'),
+        'description' => t('This is a Course pseudo field'),
+        'weight' => 100,
+        'visible' => TRUE,
+      ];
+    }
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function pll_course_node_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if ($entity->bundle() == 'course') {
+    // Load Course Instance Manager service to load active Course Instance.
+    /** @var \Drupal\pll_course\CourseInstancesManager $course_instance_manager */
+    $course_instance_manager = \Drupal::service('pll_course.course_instances_manager');
+    $course_instance = $course_instance_manager->getActiveInstance($entity);
+
+    if ($view_mode == 'full') {
+      // Create Schema Course information instead using the Meta tags module.
+      $course_schema = [
+        '@context' => stripslashes('https://schema.org'),
+        '@type' => 'Course',
+        'name' => $entity->getTitle(),
+        'description' => strip_tags($entity->field_summary->value),
+        'provider' => [
+          '@type' => "CollegeOrUniversity",
+          'name' => "Harvard Online",
+          'url' => "https://www.harvardonline.harvard.edu",
+        ],
+      ];
+
+      // Only adding Offer schema if the course doesn't have Additional Fee.
+      if (!$course_instance_manager->hasAdditinalFees($course_instance)) {
+        // Set Offer as "Free" based on custom course instance logic.
+        if ($course_instance_manager->isFree($course_instance)) {
+          $course_schema['offers'] = [
+            "@type" => "Offer",
+            'category' => "Free",
+          ];
+        }
+        else {
+          // Set Offer as "Paid".
+          $course_schema['offers'] = [
+            "@type" => "Offer",
+            'category' => "Paid",
+            "priceCurrency" => "USD",
+          ];
+          // If max price has value use instead of price field.
+          if (!$course_instance->get('field_max_price')->isEmpty()) {
+            $course_schema['offers']['price'] = round($course_instance->get('field_max_price')->value);
+          }
+          else {
+            $course_schema['offers']['price'] = round($course_instance->get('field_price')->value);
+          }
+        }
+      }
+
+      // Map Drupal modality values with accepted by Schema.
+      $modality_mapping = [
+        'InPerson' => 'Onsite',
+        'Blended' => 'Blended',
+        'Online' => 'Online',
+        'OnlineLive' => 'Online',
+      ];
+      $modality_key = $course_instance->get('field_modality')->value;
+
+      $course_schema['hasCourseInstance'] = [
+        '@type' => 'CourseInstance',
+        'courseMode' => $modality_mapping[$modality_key],
+      ];
+
+      // Adding courseSchedule information when instance is not "Available Anytime"
+      if (!$course_instance_manager->isAvailableAnytime($course_instance)) {
+        $course_schema['hasCourseInstance']['courseSchedule'] = [
+          '@type' => "Schedule",
+          'startDate' => $course_instance->field_course_date->value,
+          'endDate' => $course_instance->field_course_date->end_value,
+        ];
+      }
+
+      // Add Repeat count when "Duration in Weeks" has value.
+      if (!$course_instance->get('field_duration_in_weeks')->isEmpty()) {
+        $course_schema['hasCourseInstance']['courseSchedule']['repeatCount'] = $course_instance->field_duration_in_weeks->value;
+        $course_schema['hasCourseInstance']['courseSchedule']['repeatFrequency'] = "Weekly";
+      }
+
+      // Check if Time Commitment field has value to add on CourseSchedule.
+      // The Duration parameter uses '8601' duration format.
+      if (!$entity->get('field_time_commitment')->isEmpty()) {
+        $duration_value = $entity->field_time_commitment->to;
+        $duration_unit = $entity->field_time_commitment_alternativ->value;
+
+        $duration_mapping = [
+          'hour_week' => "T{$duration_value}H",
+          'day' => "{$duration_value}D",
+          'week' => "{$duration_value}W",
+          'month' => "{$duration_value}M",
+        ];
+
+        /**
+         * If Timme Commitment Unit is "Total Hour", replace CourseSchedule
+         * by courseWorkload.
+         */
+        if ($duration_unit == 'total_hour') {
+          $course_schema['hasCourseInstance']['courseWorkload'] = "PT{$duration_value}H";
+          unset($course_schema['hasCourseInstance']['courseSchedule']);
+        }
+        else {
+          $course_schema['hasCourseInstance']['courseSchedule']['duration'] = 'P' . $duration_mapping[$duration_unit];
+        }
+      }
+
+      // Include schema on page head.
+      $description = [
+        '#tag' => 'script',
+        '#attributes' => [
+          'type' => 'application/ld+json',
+        ],
+        '#value' => json_encode($course_schema, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT),
+      ];
+      $build['#attached']['html_head'][] = [$description, 'course_schema'];
+    }
+  }
+
+  // Course pseudo fields render.
+  if ($display->getComponent('course_pseudo_field_date') && $course_instance instanceof NodeInterface) {
+    $available_anytime = $course_instance->field_available_anytime->value;
+    if ($available_anytime === '1') {
+      $build['course_pseudo_field_date'] = $course_instance->get('field_available_anytime')->view('sub_header');
+    }
+    else {
+      $build['course_pseudo_field_date'] = $course_instance->get('field_course_date')->view('sub_header');
+    }
+  }
+  if ($display->getComponent('course_pseudo_field_modality') && $course_instance instanceof NodeInterface) {
+    $build['course_pseudo_field_modality'] = $course_instance->get('field_modality')->view('sub_header');
+  }
+  if ($display->getComponent('course_pseudo_field_platform') && $course_instance instanceof NodeInterface) {
+    $build['course_pseudo_field_platform'] = $course_instance->get('field_platform')->view('sub_header');
+  }
+  if ($display->getComponent('course_pseudo_field_registration_deadline') && $course_instance instanceof NodeInterface) {
+    $registration_deadline = $course_instance->get('field_registration_deadline')->getValue();
+    if ($registration_deadline) {
+      $build['course_pseudo_field_registration_deadline'] = $course_instance->get('field_registration_deadline')->view('full');
+      $date = $build['course_pseudo_field_registration_deadline'][0]['#text'];
+      $build['course_pseudo_field_registration_deadline'][0]['#text'] = 'Register by ' . $date;
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_node().
+ */
+function pll_course_preprocess_node__course__sub_header(&$variables) {
+  $node = $variables['node'];
+
+  // If media field is empty, apply placeholder image.
+  if ($node->get('field_media')->isEmpty()) {
+    $media = Media::load(MEDIA_IMAGE_PLACEHOLDER);
+    $node->set('field_media', $media);
+    $variables['content']['field_media'] = $node->get('field_media')->view('sub_header');
+  }
+}
+
+/**
+ * Implements hook_preprocess_node().
+ */
+function pll_course_preprocess_node__course_instance__teaser(&$variables) {
+  $course_instance = $variables['elements']['#node'];
+  $course = $course_instance->get('field_course_reference')->referencedEntities();
+
+  // If the Course Reference is empty, avoid the custom logic.
+  if (empty($course)) {
+    return;
+  }
+
+  // Get the first one reference.
+  $course = reset($course);
+
+  // Override title using Course Node title.
+  $title = $course->get('title')->value;
+  $variables['content']['title'][0]['#title']['#context']['value'] = $title;
+
+  // Change course instance URL if it's the active instance.
+  $course_instance_manager = \Drupal::service('pll_course.course_instances_manager');
+  $course_active_instance_id = $course_instance_manager->getActiveInstance($course, FALSE);
+  if ($course_instance->id() == $course_active_instance_id) {
+    $active_course_url = $course->toUrl();
+    $variables['content']['title'][0]['#url'] = $active_course_url;
+  }
+  else {
+    // Change the image URL to non-active course instance.
+    $variables['content']['extra_field_pll_extra_field_media'][0]['#url'] = $course_instance->toUrl();
+  }
+
+  $variables['course_status'] = $course_instance_manager->instanceStatus($course_instance);
+  $variables['is_available_anytime'] = $course_instance_manager->isAvailableAnytime($course_instance);
+}
+
+/**
+ * Implements hook_preprocess_field__FIELD_MACHINE_NAME().
+ */
+function pll_course_preprocess_field__field_modality(&$variables) {
+  $view_mode = $variables['element']['#view_mode'];
+  if ($view_mode == 'sub_header') {
+    $variables['items'][4]['content']['#suffix'] = '<a class="icon-question-circle text-color-black text-decoration-none" href="/modality-help" target="_blank" title="Help me choose"></a>';
+  }
+}
+
+/**
+ * Implements hook_preprocess_field__FIELD_MACHINE_NAME().
+ */
+function pll_course_preprocess_field__body(&$variables) {
+  // Change field body label based on grouping type.
+  $bundle = $variables['element']['#bundle'];
+
+  if ($bundle == 'grouping') {
+    $grouping_type = $variables['element']['#object']->get('field_grouping_type')->value;
+
+    if ($grouping_type == 'series') {
+      $variables['label'] = 'About this series';
+    }
+    else {
+      $variables['label'] = 'About this collection';
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_field__FIELD_MACHINE_NAME().
+ */
+function pll_course_preprocess_field__field_course_outline(&$variables) {
+  // Remove field course outline if empty.
+  $outline_items = $variables['items'];
+  foreach ($outline_items as $key => $item) {
+    $item_content = $item['content']['#paragraph']->get('field_outline_title')->getValue();
+    if (!$item_content) {
+      unset($variables['items'][$key]);
+    }
+  }
+  if (empty($variables['items'])) {
+    unset($variables['label']);
+  }
+}
+
+/**
+ * Implements hook_preprocess_field().
+ */
+function pll_course_preprocess_field__field_topics(array &$variables) {
+  // Remove topic parent terms.
+  $topics_references = $variables['element']['#object']->get('field_topics')->referencedEntities();
+  $taxonomy_term_manager = \Drupal::entityTypeManager()->getStorage('taxonomy_term');
+  $course_instances_manager = \Drupal::service('pll_course.course_instances_manager');
+
+  foreach ($topics_references as $key => $topic) {
+    $topic_children = $taxonomy_term_manager->getChildren($topic);
+    // Unset all parent terms and display only children.
+    if ($topic_children) {
+      unset($variables['items'][$key]);
+      continue;
+    }
+    // Unset terms that appears on 1 course or less.
+    $course_instance_count_by_topic = $course_instances_manager->countActiveCourseInstancesTopic($topic->id());
+    if ($course_instance_count_by_topic <= 1) {
+      unset($variables['items'][$key]);
+    }
+  }
+}
+
+/**
+ * Implements template_preprocess_field__FIELD_MACHINE_NAME().
+ */
+function pll_course_preprocess_field__field_course_url(array &$variables) {
+  $node = $variables['element']['#object'];
+
+  // Update link text to "Learn More".
+  if ($node instanceof NodeInterface) {
+    $variables['items'][0]['content']['#title'] = t('Learn More');
+  }
+
+  // Check if field_platform has value to render image.
+  if ($node->hasField('field_platform') && !$node->get('field_platform')->isEmpty()) {
+    $platforms = $node->get('field_platform')->referencedEntities();
+
+    // Check if taxonomy term has logo.
+    if (!$platforms[0]->get('field_logo')->isEmpty()) {
+      $platform_name = $platforms[0]->getName();
+      // Render taxonomy term to put markup as suffix.
+      $platform_output = $node->get('field_platform')->view('default');
+      $platform_markup = \Drupal::service('renderer')->render($platform_output);
+
+      // Apply aria-label on link.
+      $variables['items'][0]['content']['#attributes']['aria-label'] = t('Learn more on ' . $platform_name . ' platform');
+
+      // Attach suffix output.
+      $variables['items'][0]['content']['#suffix'] = '<span aria-hidden="true">on</span>' . $platform_markup;
+
+      $variables['attributes']['class'][] = 'course-platform-' . Html::getClass($platform_name);
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_node().
+ */
+function pll_course_preprocess_node__grouping__sub_header(&$variables) {
+  $node = $variables['elements']['#node'];
+
+  // Add max price value in the price field.
+  if (!$node->get('field_max_price')->isEmpty()) {
+    $price = $node->field_price->value;
+    $price_format = number_format($price);
+    $max_price = $node->field_max_price->value;
+    $max_price_format = number_format($max_price);
+    $variables['content']['field_price'][0]['#markup'] = '$' . $price_format . ' - ' . '$' . $max_price_format;
+  }
+
+  // In grouping field "Subject" label must be "Subjects".
+  $variables['content']['extra_field_pll_extra_field_subject']['#label'] = t('Subjects');
+}
+
+/**
+ * Implements hook_views_pre_view().
+ */
+function pll_course_views_pre_view(ViewExecutable $view, $display_id) {
+  if ($display_id == 'grouping_courses') {
+    $node = \Drupal::routeMatch()->getParameter('node');
+
+    if ($node instanceof NodeInterface && $node->bundle() == 'grouping') {
+      $courses = $node->get('field_courses')->referencedEntities();
+      $course_instance_manager = \Drupal::service('pll_course.course_instances_manager');
+
+      $course_instance_ids = [];
+      foreach ($courses as $course) {
+        $course_instance_ids[] = $course_instance_manager->getActiveInstance($course, FALSE);
+      }
+      $view->setArguments([implode('+', $course_instance_ids)]);
+    }
+  }
+  elseif ($display_id == 'grouping_faculty') {
+    $node = \Drupal::routeMatch()->getParameter('node');
+
+    if ($node instanceof NodeInterface && $node->bundle() == 'grouping') {
+      $courses = $node->get('field_courses')->referencedEntities();
+      $faculty_ids = [];
+      foreach ($courses as $course) {
+        $faculties = array_column($course->get('field_faculty')->getValue(), 'target_id');
+        $faculty_ids = array_merge($faculty_ids, $faculties);
+      }
+
+      $faculty_ids = array_unique($faculty_ids);
+
+      $view->setArguments([implode('+', $faculty_ids)]);
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_html().
+ */
+function pll_course_preprocess_html(&$variables) {
+
+  if (isset($variables['node_type'])) {
+    if ($variables['node_type'] == 'course') {
+      $course = \Drupal::routeMatch()->getParameter('node');
+
+      $course_instance_manager = \Drupal::service('pll_course.course_instances_manager');
+      $no_index = $course_instance_manager->checkNoIndexCourseInstances($course->id());
+
+      if ($no_index) {
+        $has_robots = FALSE;
+        foreach ($variables['page']['#attached']['html_head'] as $key => $value) {
+          if ($value[1] == 'robots') {
+            $has_robots = TRUE;
+            if (!strpos($value[0]['#attributes']['content'], 'noindex')) {
+              $variables['#attached']['html_head'][$key][0]['#attributes']['content'] .= ', noindex';
+            }
+          }
+        }
+        if (!$has_robots) {
+          $robots = [
+            '#tag' => 'meta',
+            '#attributes' => [
+              'name' => 'robots',
+              'content' => 'noindex',
+            ],
+          ];
+
+          $variables['page']['#attached']['html_head'][] = [$robots, 'robots'];
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_NODE_ACCESS().
+ */
+function pll_course_node_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  // Forbid access to anonymous users to view course instance.
+  if ($account->isAnonymous()) {
+    if ($entity->bundle() == 'course_instance' && $operation == 'view') {
+      $course_instance_manager = \Drupal::service('pll_course.course_instances_manager');
+      $course = $course_instance_manager->getCourseByInstance($entity);
+      if (!$course->isPublished()) {
+        return AccessResult::forbidden();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function pll_course_preprocess_field__field_course(&$variables) {
+  // Search for all entity reference field types.
+  $route_name = Drupal::routeMatch()->getRouteName();
+
+  foreach ($variables['items'] as $key => &$item) {
+
+    // Check if Entity Reference is node course instance.
+    $node = $item['content']['#node'];
+    if ($node instanceof NodeInterface && $node->bundle() == 'course_instance') {
+      $course_instances_manager = Drupal::service('pll_course.course_instances_manager');
+
+      // If the course instance is closed, search for an open instance.
+      if ($course_instances_manager->isClosed($node)) {
+        $course = $course_instances_manager->getCourseByInstance($node);
+        $active_instance = $course_instances_manager->getActiveInstance($course);
+
+        // If active instance is open, replace by closed.
+        if (!$course_instances_manager->isClosed($active_instance)) {
+          $item['content']['#node'] = $active_instance;
+        }
+        else {
+          // If the latest active instance is closed and user is Anonymous,
+          // remove item from Render.
+          if ($route_name == 'entity.node.canonical') {
+            unset($variables['items'][$key]);
+          }
+          else {
+            $item['attributes']->addClass('item-disabled');
+          }
+        }
+      }
+    }
+  }
+  // Show only first 3 items for Anonymous users.
+  if ($route_name == 'entity.node.canonical') {
+    $variables['items'] = array_slice($variables['items'], 0, 3);
+  }
+}
+
+/**
+ * Implements template_preprocess_field__FIELD_ID().
+ */
+function pll_course_preprocess_field__field_faculty(&$variables) {
+  // Search for all entity reference field types.
+  foreach ($variables['items'] as $key => &$item) {
+    // Check if Entity Reference is node course instance.
+    $node = $item['content']['#node'];
+    if ($node instanceof NodeInterface && $node->bundle() == 'faculty') {
+      $faculty_manager = Drupal::service('pll_course.faculty_manager');
+      // If the course instance is closed, search for an open instance.
+      if ($faculty_manager->hasNoActiveCourses($node)) {
+        $variables['items'][$key]['content']['#view_mode'] = 'teaser_no_link';
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_rabbit_hole_response_alter().
+ */
+function pll_course_rabbit_hole_response_alter(&$response, ContentEntityInterface $entity) {
+  // Customize node to redirect if External Link has value.
+  if ($entity instanceof NodeInterface && $entity->bundle() == 'faculty') {
+    $faculty_manager = Drupal::service('pll_course.faculty_manager');
+    if ($faculty_manager->hasNoActiveCourses($entity)) {
+      throw new AccessDeniedHttpException();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function pll_course_node_presave($entity) {
+  $node_type = $entity->bundle();
+  if (in_array($node_type, ['course', 'course_instance'])) {
+    $faculty_manager = Drupal::service('pll_course.faculty_manager');
+
+    if ($node_type == 'course') {
+      // Fetch Faculties by Course reference.
+      $faculties = $faculty_manager->loadFacultyByCourse($entity);
+    }
+    else {
+      // Fetch Faculties by Course Instance reference.
+      $faculties = $faculty_manager->loadFacultyByCourseInstance($entity);
+    }
+
+    if ($faculties) {
+      $faculty_nids = [];
+      foreach ($faculties as $faculty) {
+        // Force Faculty nodes referenced on course to re-index.
+        \Drupal::getContainer()->get('search_api.entity_datasource.tracking_manager')->entityUpdate($faculty);
+
+        // Build array with Faculty Node IDs.
+        $faculty_nids[] = $faculty->id();
+      }
+
+      // Invalidate Faculty nodes caches when update a Course Instance node.
+      $faculties_cache_tags = Cache::buildTags('node', $faculty_nids);
+      Cache::invalidateTags($faculties_cache_tags);
+    }
+  }
+
+  // When update course instance node, clear caches from course node.
+  if ($node_type == 'course_instance') {
+    $course_instances_manager = \Drupal::service('pll_course.course_instances_manager');
+    // Get Course Referenced ID.
+    $course = $course_instances_manager->getCourseByInstance($entity);
+    // Clear the cache tag from Node.
+    \Drupal::service('cache_tags.invalidator')->invalidateTags(["node:" . $course->id()]);
+  }
+}
+
+/**
+ * Implements hook_schema_metatag_property_type_plugins_alter().
+ */
+function pll_course_schema_metatag_property_type_plugins_alter(array &$definitions) {
+  // Override Schema ItemList plugin to work with Course Instance reference
+  // and return Course URL instead.
+  $definitions['item_list_element']['class'] = '\Drupal\pll_course\Plugin\schema_metatag\PropertyType\CourseItemListElement';
+}
